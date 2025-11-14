@@ -1,6 +1,6 @@
 // attention_compare.cu
-// Compare dense vs "streaming" (sparse sliding-window) attention in CUDA
-// Fixed sizes: B=64, T=256, C=384
+// Compare dense vs "streaming" (sinks + sliding-window) attention in CUDA
+// Runtime T, WINDOW_SIZE, SINK_SIZE; fixed B=1, C=384
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -8,6 +8,13 @@
 #include <vector>
 #include <random>
 #include <iostream>
+
+// Use our own min/max to avoid std::algorithm issues with nvcc
+template<typename T>
+__host__ __device__ inline T min_val(T a, T b) { return (a < b) ? a : b; }
+
+template<typename T>
+__host__ __device__ inline T max_val(T a, T b) { return (a > b) ? a : b; }
 
 #define CHECK_CUDA(call)                                                      \
     do {                                                                      \
@@ -19,13 +26,11 @@
         }                                                                     \
     } while (0)
 
-// Fixed problem sizes (you can change these if you want)
-constexpr int B = 64;    // batch
-constexpr int T = 256;   // sequence length
-constexpr int C = 384;   // channel / head dim
-
-// For streaming attention: each timestep attends to at most this many past tokens
-constexpr int WINDOW_SIZE = 64;
+// ---------- Fixed global limits (to keep local arrays compile-time-sized) ----------
+constexpr int B = 1;          // batch size fixed to 1
+constexpr int C = 384;        // channel / head dimension
+constexpr int MAX_T = 4096;   // maximum supported sequence length
+constexpr int MAX_KEYS = 512; // max sink+window keys per query (must >= window+sink)
 
 // ---------------------- Dense attention kernel ---------------------- //
 // Q, K, V, O are all [B, T, C] flattened as row-major: ((b*T + t)*C + c)
@@ -35,29 +40,28 @@ __global__ void dense_attention_kernel(
     const float* __restrict__ K,
     const float* __restrict__ V,
     float* __restrict__ O,
-    int B, int T, int C,
+    int B_runtime, int T_runtime, int C_runtime,
     float scale)
 {
     int row = blockIdx.x * blockDim.x + threadIdx.x; // each thread = one (b, t_query)
-    int total_rows = B * T;
+    int total_rows = B_runtime * T_runtime;
     if (row >= total_rows) return;
 
-    int b = row / T;
-    int t_q = row % T;
+    int b   = row / T_runtime;
+    int t_q = row % T_runtime;
 
-    const float* q_vec = &Q[(b * T + t_q) * C];
-    float* out_vec     = &O[(b * T + t_q) * C];
+    const float* q_vec = &Q[(b * T_runtime + t_q) * C_runtime];
+    float*       out_vec = &O[(b * T_runtime + t_q) * C_runtime];
 
-    // FIX: T is compile-time constant from host, but kernel doesn't treat it as such.
-    // So we use a hardcoded max size.
-    float scores_local[256];   // MAX_T = 256
+    // Local buffer for scores over all keys (up to MAX_T)
+    float scores_local[MAX_T];
 
     // 1) Compute raw scores = q · k_j / sqrt(C)
     float max_score = -1e30f;
-    for (int t_k = 0; t_k < T; ++t_k) {
-        const float* k_vec = &K[(b * T + t_k) * C];
+    for (int t_k = 0; t_k < T_runtime; ++t_k) {
+        const float* k_vec = &K[(b * T_runtime + t_k) * C_runtime];
         float dot = 0.0f;
-        for (int c = 0; c < C; ++c) {
+        for (int c = 0; c < C_runtime; ++c) {
             dot += q_vec[c] * k_vec[c];
         }
         float s = dot * scale;
@@ -67,7 +71,7 @@ __global__ void dense_attention_kernel(
 
     // 2) Softmax denominator
     float denom = 0.0f;
-    for (int t_k = 0; t_k < T; ++t_k) {
+    for (int t_k = 0; t_k < T_runtime; ++t_k) {
         float e = expf(scores_local[t_k] - max_score);
         scores_local[t_k] = e;  // store exp(score - max) for reuse
         denom += e;
@@ -75,11 +79,11 @@ __global__ void dense_attention_kernel(
     float inv_denom = 1.0f / denom;
 
     // 3) Weighted sum over V
-    for (int c = 0; c < C; ++c) {
+    for (int c = 0; c < C_runtime; ++c) {
         float acc = 0.0f;
-        for (int t_k = 0; t_k < T; ++t_k) {
+        for (int t_k = 0; t_k < T_runtime; ++t_k) {
             float w = scores_local[t_k] * inv_denom; // softmax weight
-            const float* v_vec = &V[(b * T + t_k) * C];
+            const float* v_vec = &V[(b * T_runtime + t_k) * C_runtime];
             acc += w * v_vec[c];
         }
         out_vec[c] = acc;
@@ -87,72 +91,98 @@ __global__ void dense_attention_kernel(
 }
 
 // ------------------ Streaming (sparse) attention kernel ------------------ //
-// "Streaming" here = sliding-window: each token attends only to last WINDOW_SIZE
-// tokens (and itself). This is *much* cheaper than full T for large T.
+// "Streaming" = sink tokens + sliding window:
 //
-// We still create a 256x256 attention mask on the host to match this pattern,
-// but the kernel uses the window math directly (faster than reading the mask).
+// For a query at position t_q:
+//   - If t_q < sink_size: attends to positions [0..t_q] (normal causal).
+//   - If t_q >= sink_size:
+//       * Global sinks: positions [0..sink_size-1]
+//       * Local window: positions [max(sink_size, t_q - window_size + 1) .. t_q]
 
 __global__ void streaming_attention_kernel(
     const float* __restrict__ Q,
     const float* __restrict__ K,
     const float* __restrict__ V,
     float* __restrict__ O,
-    int B, int T, int C,
+    int B_runtime, int T_runtime, int C_runtime,
     int window_size,
+    int sink_size,
     float scale)
 {
     int row = blockIdx.x * blockDim.x + threadIdx.x; // each thread = one (b, t_query)
-    int total_rows = B * T;
+    int total_rows = B_runtime * T_runtime;
     if (row >= total_rows) return;
 
-    int b = row / T;
-    int t_q = row % T;
+    int b   = row / T_runtime;
+    int t_q = row % T_runtime;
 
-    const float* q_vec = &Q[(b * T + t_q) * C];
-    float* out_vec     = &O[(b * T + t_q) * C];
+    const float* q_vec = &Q[(b * T_runtime + t_q) * C_runtime];
+    float*       out_vec = &O[(b * T_runtime + t_q) * C_runtime];
 
-    // Streaming: attend only to [max(0, t_q - window_size + 1), t_q]
-    int t_start = t_q - window_size + 1;
-    if (t_start < 0) t_start = 0;
-    int t_end = t_q; // inclusive
+    // We will build a compact list of key indices this query can attend to.
+    float scores_local[MAX_KEYS];
+    int   key_index_local[MAX_KEYS];
 
-    int window_len = t_end - t_start + 1;
+    int len = 0; // number of active keys for this query
 
-    // FIX: WINDOW_SIZE is compile-time constant from host, but kernel doesn't treat it as such.
-    // So we use a hardcoded max size.
-    float scores_local[64];    // WINDOW_SIZE=64 is constant
+    // ----- 1) Sink tokens -----
+    int sink_len = (sink_size < T_runtime ? sink_size : T_runtime); // clamp if T small
+    if (sink_len > 0) {
+        // For early tokens, don't go past t_q.
+        int sink_attend_end = (t_q < (sink_len - 1) ? t_q : (sink_len - 1));
+        for (int j = 0; j <= sink_attend_end; ++j) {
+            key_index_local[len++] = j;
+        }
+    }
 
-    // 1) Compute raw scores within the window
+    // ----- 2) Local sliding window (for non-sink tokens) -----
+    if (t_q >= sink_len) {
+        int t_start = t_q - window_size + 1;
+        if (t_start < sink_len) t_start = sink_len; // don't re-include sinks
+        int t_end = t_q;
+
+        for (int j = t_start; j <= t_end; ++j) {
+            if (len < MAX_KEYS) {
+                key_index_local[len++] = j;
+            }
+        }
+    }
+
+    // Just a safety guard (should not trigger for our chosen bounds)
+    if (len > MAX_KEYS) len = MAX_KEYS;
+
+    // ----- 3) Compute scores over the selected keys -----
     float max_score = -1e30f;
-    for (int idx = 0; idx < window_len; ++idx) {
-        int t_k = t_start + idx;
-        const float* k_vec = &K[(b * T + t_k) * C];
+    for (int idx = 0; idx < len; ++idx) {
+        int t_k = key_index_local[idx];
+        const float* k_vec = &K[(b * T_runtime + t_k) * C_runtime];
+
         float dot = 0.0f;
-        for (int c = 0; c < C; ++c) {
+        for (int c = 0; c < C_runtime; ++c) {
             dot += q_vec[c] * k_vec[c];
         }
+
         float s = dot * scale;
         scores_local[idx] = s;
         if (s > max_score) max_score = s;
     }
 
-    // 2) Softmax denominator within the window
+    // ----- 4) Softmax over selected keys -----
     float denom = 0.0f;
-    for (int idx = 0; idx < window_len; ++idx) {
+    for (int idx = 0; idx < len; ++idx) {
         float e = expf(scores_local[idx] - max_score);
         scores_local[idx] = e;
         denom += e;
     }
     float inv_denom = 1.0f / denom;
 
-    // 3) Weighted sum over V in the window
-    for (int c = 0; c < C; ++c) {
+    // ----- 5) Weighted sum over V -----
+    for (int c = 0; c < C_runtime; ++c) {
         float acc = 0.0f;
-        for (int idx = 0; idx < window_len; ++idx) {
-            int t_k = t_start + idx;
+        for (int idx = 0; idx < len; ++idx) {
+            int t_k = key_index_local[idx];
             float w = scores_local[idx] * inv_denom;
-            const float* v_vec = &V[(b * T + t_k) * C];
+            const float* v_vec = &V[(b * T_runtime + t_k) * C_runtime];
             acc += w * v_vec[c];
         }
         out_vec[c] = acc;
@@ -160,30 +190,80 @@ __global__ void streaming_attention_kernel(
 }
 
 // ---------------------- Host utility: build mask ---------------------- //
-// Build a T x T attention mask (row-major) for the same sliding window pattern.
-// mask[i*T + j] = 1 if token i can attend to token j, else 0.
+// Build a T x T attention mask (row-major) for "streaming" pattern
+// with sinks + sliding window.
+//
+// For each query i:
+//   - if i < sink_size : attends [0..i] (normal causal prefix)
+//   - else:
+//        * attends to all sink tokens [0..sink_size-1]
+//        * plus local window [max(sink_size, i - window_size + 1) .. i]
 
-void build_streaming_mask(std::vector<unsigned char>& mask, int T, int window_size) {
-    mask.assign(T * T, 0);
-    for (int i = 0; i < T; ++i) {
-        int j_start = i - window_size + 1;
-        if (j_start < 0) j_start = 0;
-        int j_end = i; // causal
-        for (int j = j_start; j <= j_end; ++j) {
-            mask[i * T + j] = 1;
+void build_streaming_mask(std::vector<unsigned char>& mask,
+                          int T_runtime,
+                          int window_size,
+                          int sink_size)
+{
+    mask.assign(T_runtime * T_runtime, 0);
+
+    int sink_len = min_val(sink_size, T_runtime);
+
+    for (int i = 0; i < T_runtime; ++i) {
+        if (i < sink_len) {
+            // Early tokens (including sinks themselves): simple causal mask
+            for (int j = 0; j <= i; ++j) {
+                mask[i * T_runtime + j] = 1;
+            }
+        } else {
+            // 1) Sinks: always visible
+            for (int j = 0; j < sink_len; ++j) {
+                mask[i * T_runtime + j] = 1;
+            }
+            // 2) Local window over non-sink positions
+            int j_start = i - window_size + 1;
+            if (j_start < sink_len) j_start = sink_len;
+            int j_end = i;
+            for (int j = j_start; j <= j_end; ++j) {
+                if (j >= 0 && j < T_runtime) {
+                    mask[i * T_runtime + j] = 1;
+                }
+            }
         }
     }
 }
 
 // ------------------------------ Main ------------------------------ //
 
-int main() {
-    std::cout << "Comparing dense vs streaming sparse attention\n";
-    std::cout << "B=" << B << ", T=" << T << ", C=" << C
-              << ", WINDOW_SIZE=" << WINDOW_SIZE << "\n";
+int main(int argc, char** argv) {
+    // Runtime parameters with defaults
+    int T_runtime       = 1024;
+    int window_size     = 64;
+    int sink_size       = 16;
 
-    const int num_elements = B * T * C;
-    const size_t bytes = num_elements * sizeof(float);
+    if (argc >= 2) T_runtime   = std::atoi(argv[1]);   // ./attention_compare T
+    if (argc >= 3) window_size = std::atoi(argv[2]);   // ./attention_compare T window
+    if (argc >= 4) sink_size   = std::atoi(argv[3]);   // ./attention_compare T window sink
+
+    if (T_runtime > MAX_T) {
+        std::cerr << "Error: TRuntime=" << T_runtime
+                  << " > MAX_T=" << MAX_T << "\n";
+        return 1;
+    }
+
+    if (window_size + sink_size > MAX_KEYS) {
+        std::cerr << "Error: window_size + sink_size = "
+                  << (window_size + sink_size)
+                  << " > MAX_KEYS=" << MAX_KEYS << "\n";
+        return 1;
+    }
+
+    std::cout << "Comparing dense vs streaming sparse attention\n";
+    std::cout << "B=" << B << ", T=" << T_runtime << ", C=" << C
+              << ", WINDOW_SIZE=" << window_size
+              << ", SINK_SIZE=" << sink_size << "\n";
+
+    const int num_elements = B * T_runtime * C;
+    const size_t bytes = static_cast<size_t>(num_elements) * sizeof(float);
 
     // Host buffers
     std::vector<float> h_Q(num_elements);
@@ -201,9 +281,9 @@ int main() {
         h_V[i] = dist(rng);
     }
 
-    // Build the 256x256 attention mask on host (mainly for debugging / visualization)
+    // Build the T x T attention mask on host (mainly for debugging / visualization)
     std::vector<unsigned char> h_mask;
-    build_streaming_mask(h_mask, T, WINDOW_SIZE);
+    build_streaming_mask(h_mask, T_runtime, window_size, sink_size);
 
     // Device buffers
     float *d_Q, *d_K, *d_V, *d_O_dense, *d_O_stream;
@@ -214,16 +294,17 @@ int main() {
     CHECK_CUDA(cudaMalloc(&d_V, bytes));
     CHECK_CUDA(cudaMalloc(&d_O_dense, bytes));
     CHECK_CUDA(cudaMalloc(&d_O_stream, bytes));
-    CHECK_CUDA(cudaMalloc(&d_mask, T * T * sizeof(unsigned char)));
+    CHECK_CUDA(cudaMalloc(&d_mask, static_cast<size_t>(T_runtime) * T_runtime * sizeof(unsigned char)));
 
     CHECK_CUDA(cudaMemcpy(d_Q, h_Q.data(), bytes, cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_K, h_K.data(), bytes, cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_V, h_V.data(), bytes, cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_mask, h_mask.data(), T * T * sizeof(unsigned char),
+    CHECK_CUDA(cudaMemcpy(d_mask, h_mask.data(),
+                          static_cast<size_t>(T_runtime) * T_runtime * sizeof(unsigned char),
                           cudaMemcpyHostToDevice));
 
     // Launch configuration: one thread per (b, t)
-    int total_rows = B * T;
+    int total_rows = B * T_runtime;
     int threads = 128;
     int blocks  = (total_rows + threads - 1) / threads;
 
@@ -238,9 +319,15 @@ int main() {
     CHECK_CUDA(cudaEventCreate(&stop_stream));
 
     // Warm-up runs (to avoid cold-start bias)
-    dense_attention_kernel<<<blocks, threads>>>(d_Q, d_K, d_V, d_O_dense, B, T, C, scale);
-    streaming_attention_kernel<<<blocks, threads>>>(d_Q, d_K, d_V, d_O_stream,
-                                                    B, T, C, WINDOW_SIZE, scale);
+    dense_attention_kernel<<<blocks, threads>>>(d_Q, d_K, d_V,
+                                                d_O_dense,
+                                                B, T_runtime, C, scale);
+    streaming_attention_kernel<<<blocks, threads>>>(d_Q, d_K, d_V,
+                                                    d_O_stream,
+                                                    B, T_runtime, C,
+                                                    window_size,
+                                                    sink_size,
+                                                    scale);
     CHECK_CUDA(cudaDeviceSynchronize());
 
     const int iters = 10;
@@ -249,7 +336,8 @@ int main() {
     CHECK_CUDA(cudaEventRecord(start_dense));
     for (int it = 0; it < iters; ++it) {
         dense_attention_kernel<<<blocks, threads>>>(d_Q, d_K, d_V,
-                                                    d_O_dense, B, T, C, scale);
+                                                    d_O_dense,
+                                                    B, T_runtime, C, scale);
     }
     CHECK_CUDA(cudaEventRecord(stop_dense));
     CHECK_CUDA(cudaEventSynchronize(stop_dense));
@@ -262,8 +350,10 @@ int main() {
     for (int it = 0; it < iters; ++it) {
         streaming_attention_kernel<<<blocks, threads>>>(d_Q, d_K, d_V,
                                                         d_O_stream,
-                                                        B, T, C,
-                                                        WINDOW_SIZE, scale);
+                                                        B, T_runtime, C,
+                                                        window_size,
+                                                        sink_size,
+                                                        scale);
     }
     CHECK_CUDA(cudaEventRecord(stop_stream));
     CHECK_CUDA(cudaEventSynchronize(stop_stream));
@@ -279,9 +369,9 @@ int main() {
     CHECK_CUDA(cudaMemcpy(h_O_dense.data(), d_O_dense, bytes, cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(h_O_stream.data(), d_O_stream, bytes, cudaMemcpyDeviceToHost));
 
-    std::cout << "Example outputs (first element of batch 0, token 0, channel 0):\n";
-    std::cout << "  dense   : " << h_O_dense[0] << "\n";
-    std::cout << "  streaming: " << h_O_stream[0] << "\n";
+    std::cout << "Example outputs (b=0, t=0, c=0):\n";
+    std::cout << "  dense    : " << h_O_dense[0]   << "\n";
+    std::cout << "  streaming: " << h_O_stream[0]  << "\n";
 
     // Cleanup
     CHECK_CUDA(cudaFree(d_Q));
