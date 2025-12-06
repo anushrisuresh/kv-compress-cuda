@@ -1,389 +1,370 @@
-// attention_compare.cu
-// Compare dense vs "streaming" (sinks + sliding-window) attention in CUDA
-// Runtime T, WINDOW_SIZE, SINK_SIZE; fixed B=1, C=384
+/**
+ * streaming_att.cu
+ * Streaming attention with sink tokens and sliding window
+ * Compares dense vs sparse streaming attention in CUDA
+ */
 
-#include <cuda_runtime.h>
-#include <cstdio>
 #include <cmath>
-#include <vector>
-#include <random>
+#include <cstdio>
+#include <cuda_runtime.h>
 #include <iostream>
+#include <random>
+#include <vector>
 
-// Use our own min/max to avoid std::algorithm issues with nvcc
-template<typename T>
-__host__ __device__ inline T min_val(T a, T b) { return (a < b) ? a : b; }
-
-template<typename T>
-__host__ __device__ inline T max_val(T a, T b) { return (a > b) ? a : b; }
-
-#define CHECK_CUDA(call)                                                      \
-    do {                                                                      \
-        cudaError_t err = (call);                                             \
-        if (err != cudaSuccess) {                                             \
-            std::fprintf(stderr, "CUDA error %s:%d: %s\n",                    \
-                         __FILE__, __LINE__, cudaGetErrorString(err));        \
-            std::exit(EXIT_FAILURE);                                          \
-        }                                                                     \
-    } while (0)
-
-// ---------- Fixed global limits (to keep local arrays compile-time-sized) ----------
-constexpr int B = 1;          // batch size fixed to 1
-constexpr int C = 384;        // channel / head dimension
-constexpr int MAX_T = 4096;   // maximum supported sequence length
-constexpr int MAX_KEYS = 512; // max sink+window keys per query (must >= window+sink)
-
-// ---------------------- Dense attention kernel ---------------------- //
-// Q, K, V, O are all [B, T, C] flattened as row-major: ((b*T + t)*C + c)
-
-__global__ void dense_attention_kernel(
-    const float* __restrict__ Q,
-    const float* __restrict__ K,
-    const float* __restrict__ V,
-    float* __restrict__ O,
-    int B_runtime, int T_runtime, int C_runtime,
-    float scale)
-{
-    int row = blockIdx.x * blockDim.x + threadIdx.x; // each thread = one (b, t_query)
-    int total_rows = B_runtime * T_runtime;
-    if (row >= total_rows) return;
-
-    int b   = row / T_runtime;
-    int t_q = row % T_runtime;
-
-    const float* q_vec = &Q[(b * T_runtime + t_q) * C_runtime];
-    float*       out_vec = &O[(b * T_runtime + t_q) * C_runtime];
-
-    // Local buffer for scores over all keys (up to MAX_T)
-    float scores_local[MAX_T];
-
-    // 1) Compute raw scores = q · k_j / sqrt(C)
-    float max_score = -1e30f;
-    for (int t_k = 0; t_k < T_runtime; ++t_k) {
-        const float* k_vec = &K[(b * T_runtime + t_k) * C_runtime];
-        float dot = 0.0f;
-        for (int c = 0; c < C_runtime; ++c) {
-            dot += q_vec[c] * k_vec[c];
-        }
-        float s = dot * scale;
-        scores_local[t_k] = s;
-        if (s > max_score) max_score = s;
-    }
-
-    // 2) Softmax denominator
-    float denom = 0.0f;
-    for (int t_k = 0; t_k < T_runtime; ++t_k) {
-        float e = expf(scores_local[t_k] - max_score);
-        scores_local[t_k] = e;  // store exp(score - max) for reuse
-        denom += e;
-    }
-    float inv_denom = 1.0f / denom;
-
-    // 3) Weighted sum over V
-    for (int c = 0; c < C_runtime; ++c) {
-        float acc = 0.0f;
-        for (int t_k = 0; t_k < T_runtime; ++t_k) {
-            float w = scores_local[t_k] * inv_denom; // softmax weight
-            const float* v_vec = &V[(b * T_runtime + t_k) * C_runtime];
-            acc += w * v_vec[c];
-        }
-        out_vec[c] = acc;
-    }
+// Custom min/max for nvcc compatibility
+template <typename T> __host__ __device__ inline T min_val(T a, T b) {
+  return (a < b) ? a : b;
 }
 
-// ------------------ Streaming (sparse) attention kernel ------------------ //
-// "Streaming" = sink tokens + sliding window:
-//
-// For a query at position t_q:
-//   - If t_q < sink_size: attends to positions [0..t_q] (normal causal).
-//   - If t_q >= sink_size:
-//       * Global sinks: positions [0..sink_size-1]
-//       * Local window: positions [max(sink_size, t_q - window_size + 1) .. t_q]
+template <typename T> __host__ __device__ inline T max_val(T a, T b) {
+  return (a > b) ? a : b;
+}
 
-__global__ void streaming_attention_kernel(
-    const float* __restrict__ Q,
-    const float* __restrict__ K,
-    const float* __restrict__ V,
-    float* __restrict__ O,
-    int B_runtime, int T_runtime, int C_runtime,
-    int window_size,
-    int sink_size,
-    float scale)
-{
-    int row = blockIdx.x * blockDim.x + threadIdx.x; // each thread = one (b, t_query)
-    int total_rows = B_runtime * T_runtime;
-    if (row >= total_rows) return;
+// Error checking macro
+#define CHECK_CUDA(call)                                                       \
+  do {                                                                         \
+    cudaError_t err = (call);                                                  \
+    if (err != cudaSuccess) {                                                  \
+      std::fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__,       \
+                   cudaGetErrorString(err));                                   \
+      std::exit(EXIT_FAILURE);                                                 \
+    }                                                                          \
+  } while (0)
 
-    int b   = row / T_runtime;
-    int t_q = row % T_runtime;
+// Global constants
+constexpr int B = 1;
+constexpr int C = 384;
+constexpr int MAX_T = 4096;
+constexpr int MAX_KEYS = 512;
 
-    const float* q_vec = &Q[(b * T_runtime + t_q) * C_runtime];
-    float*       out_vec = &O[(b * T_runtime + t_q) * C_runtime];
+// ==================== Device Helpers ====================
 
-    // We will build a compact list of key indices this query can attend to.
-    float scores_local[MAX_KEYS];
-    int   key_index_local[MAX_KEYS];
+// Compute dot product (device)
+__device__ float dev_dot(const float *q, const float *k, int C_rt) {
+  float dot = 0.0f;
+  for (int c = 0; c < C_rt; ++c) {
+    dot += q[c] * k[c];
+  }
+  return dot;
+}
 
-    int len = 0; // number of active keys for this query
+// Compute scores and find max (device helper)
+__device__ float dev_compute_scores(const float *Q, const float *K, int b,
+                                    int t_q, int T_rt, int C_rt, float scale,
+                                    float *scores) {
+  const float *q_vec = &Q[(b * T_rt + t_q) * C_rt];
+  float max_score = -1e30f;
+  for (int t_k = 0; t_k < T_rt; ++t_k) {
+    const float *k_vec = &K[(b * T_rt + t_k) * C_rt];
+    float s = dev_dot(q_vec, k_vec, C_rt) * scale;
+    scores[t_k] = s;
+    if (s > max_score)
+      max_score = s;
+  }
+  return max_score;
+}
 
-    // ----- 1) Sink tokens -----
-    int sink_len = (sink_size < T_runtime ? sink_size : T_runtime); // clamp if T small
-    if (sink_len > 0) {
-        // For early tokens, don't go past t_q.
-        int sink_attend_end = (t_q < (sink_len - 1) ? t_q : (sink_len - 1));
-        for (int j = 0; j <= sink_attend_end; ++j) {
-            key_index_local[len++] = j;
-        }
+// Softmax denominator (device helper)
+__device__ float dev_softmax_denom(float *scores, int len, float max_score) {
+  float denom = 0.0f;
+  for (int i = 0; i < len; ++i) {
+    float e = expf(scores[i] - max_score);
+    scores[i] = e;
+    denom += e;
+  }
+  return denom;
+}
+
+// Weighted sum (device helper)
+__device__ void dev_weighted_sum(const float *V, float *out,
+                                 const float *scores, float inv_denom, int b,
+                                 int T_rt, int C_rt) {
+  for (int c = 0; c < C_rt; ++c) {
+    float acc = 0.0f;
+    for (int t_k = 0; t_k < T_rt; ++t_k) {
+      float w = scores[t_k] * inv_denom;
+      const float *v_vec = &V[(b * T_rt + t_k) * C_rt];
+      acc += w * v_vec[c];
     }
+    out[c] = acc;
+  }
+}
 
-    // ----- 2) Local sliding window (for non-sink tokens) -----
-    if (t_q >= sink_len) {
-        int t_start = t_q - window_size + 1;
-        if (t_start < sink_len) t_start = sink_len; // don't re-include sinks
-        int t_end = t_q;
+// ==================== Dense Attention Kernel ====================
+__global__ void dense_attention_kernel(const float *__restrict__ Q,
+                                       const float *__restrict__ K,
+                                       const float *__restrict__ V,
+                                       float *__restrict__ O, int B_rt,
+                                       int T_rt, int C_rt, float scale) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= B_rt * T_rt)
+    return;
 
-        for (int j = t_start; j <= t_end; ++j) {
-            if (len < MAX_KEYS) {
-                key_index_local[len++] = j;
-            }
-        }
+  int b = row / T_rt;
+  int t_q = row % T_rt;
+  float *out_vec = &O[(b * T_rt + t_q) * C_rt];
+  float scores[MAX_T];
+
+  float max_s = dev_compute_scores(Q, K, b, t_q, T_rt, C_rt, scale, scores);
+  float denom = dev_softmax_denom(scores, T_rt, max_s);
+  dev_weighted_sum(V, out_vec, scores, 1.0f / denom, b, T_rt, C_rt);
+}
+
+// ==================== Streaming Helpers ====================
+
+// Build key list for streaming pattern
+__device__ int build_key_list(int t_q, int sink_len, int window_size, int T_rt,
+                              int *key_idx) {
+  int len = 0;
+  if (sink_len > 0) {
+    int sink_end = (t_q < sink_len - 1) ? t_q : (sink_len - 1);
+    for (int j = 0; j <= sink_end; ++j) {
+      key_idx[len++] = j;
     }
+  }
+  if (t_q >= sink_len) {
+    int t_start = t_q - window_size + 1;
+    if (t_start < sink_len)
+      t_start = sink_len;
+    for (int j = t_start; j <= t_q; ++j) {
+      if (len < MAX_KEYS)
+        key_idx[len++] = j;
+    }
+  }
+  return len;
+}
 
-    // Just a safety guard (should not trigger for our chosen bounds)
-    if (len > MAX_KEYS) len = MAX_KEYS;
+// Compute sparse scores
+__device__ float dev_sparse_scores(const float *Q, const float *K, int b,
+                                   int t_q, int T_rt, int C_rt, float scale,
+                                   float *scores, const int *key_idx, int len) {
+  const float *q_vec = &Q[(b * T_rt + t_q) * C_rt];
+  float max_s = -1e30f;
+  for (int idx = 0; idx < len; ++idx) {
+    int t_k = key_idx[idx];
+    const float *k_vec = &K[(b * T_rt + t_k) * C_rt];
+    float s = dev_dot(q_vec, k_vec, C_rt) * scale;
+    scores[idx] = s;
+    if (s > max_s)
+      max_s = s;
+  }
+  return max_s;
+}
 
-    // ----- 3) Compute scores over the selected keys -----
-    float max_score = -1e30f;
+// Sparse weighted sum
+__device__ void dev_sparse_weighted_sum(const float *V, float *out,
+                                        const float *scores, float inv_denom,
+                                        const int *key_idx, int len, int b,
+                                        int T_rt, int C_rt) {
+  for (int c = 0; c < C_rt; ++c) {
+    float acc = 0.0f;
     for (int idx = 0; idx < len; ++idx) {
-        int t_k = key_index_local[idx];
-        const float* k_vec = &K[(b * T_runtime + t_k) * C_runtime];
-
-        float dot = 0.0f;
-        for (int c = 0; c < C_runtime; ++c) {
-            dot += q_vec[c] * k_vec[c];
-        }
-
-        float s = dot * scale;
-        scores_local[idx] = s;
-        if (s > max_score) max_score = s;
+      int t_k = key_idx[idx];
+      float w = scores[idx] * inv_denom;
+      const float *v_vec = &V[(b * T_rt + t_k) * C_rt];
+      acc += w * v_vec[c];
     }
-
-    // ----- 4) Softmax over selected keys -----
-    float denom = 0.0f;
-    for (int idx = 0; idx < len; ++idx) {
-        float e = expf(scores_local[idx] - max_score);
-        scores_local[idx] = e;
-        denom += e;
-    }
-    float inv_denom = 1.0f / denom;
-
-    // ----- 5) Weighted sum over V -----
-    for (int c = 0; c < C_runtime; ++c) {
-        float acc = 0.0f;
-        for (int idx = 0; idx < len; ++idx) {
-            int t_k = key_index_local[idx];
-            float w = scores_local[idx] * inv_denom;
-            const float* v_vec = &V[(b * T_runtime + t_k) * C_runtime];
-            acc += w * v_vec[c];
-        }
-        out_vec[c] = acc;
-    }
+    out[c] = acc;
+  }
 }
 
-// ---------------------- Host utility: build mask ---------------------- //
-// Build a T x T attention mask (row-major) for "streaming" pattern
-// with sinks + sliding window.
-//
-// For each query i:
-//   - if i < sink_size : attends [0..i] (normal causal prefix)
-//   - else:
-//        * attends to all sink tokens [0..sink_size-1]
-//        * plus local window [max(sink_size, i - window_size + 1) .. i]
+// ==================== Streaming Attention Kernel ====================
+__global__ void streaming_attention_kernel(const float *__restrict__ Q,
+                                           const float *__restrict__ K,
+                                           const float *__restrict__ V,
+                                           float *__restrict__ O, int B_rt,
+                                           int T_rt, int C_rt, int window_size,
+                                           int sink_size, float scale) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= B_rt * T_rt)
+    return;
 
-void build_streaming_mask(std::vector<unsigned char>& mask,
-                          int T_runtime,
-                          int window_size,
-                          int sink_size)
-{
-    mask.assign(T_runtime * T_runtime, 0);
+  int b = row / T_rt;
+  int t_q = row % T_rt;
+  float *out_vec = &O[(b * T_rt + t_q) * C_rt];
 
-    int sink_len = min_val(sink_size, T_runtime);
+  float scores[MAX_KEYS];
+  int key_idx[MAX_KEYS];
 
-    for (int i = 0; i < T_runtime; ++i) {
-        if (i < sink_len) {
-            // Early tokens (including sinks themselves): simple causal mask
-            for (int j = 0; j <= i; ++j) {
-                mask[i * T_runtime + j] = 1;
-            }
-        } else {
-            // 1) Sinks: always visible
-            for (int j = 0; j < sink_len; ++j) {
-                mask[i * T_runtime + j] = 1;
-            }
-            // 2) Local window over non-sink positions
-            int j_start = i - window_size + 1;
-            if (j_start < sink_len) j_start = sink_len;
-            int j_end = i;
-            for (int j = j_start; j <= j_end; ++j) {
-                if (j >= 0 && j < T_runtime) {
-                    mask[i * T_runtime + j] = 1;
-                }
-            }
-        }
-    }
+  int sink_len = (sink_size < T_rt) ? sink_size : T_rt;
+  int len = build_key_list(t_q, sink_len, window_size, T_rt, key_idx);
+  if (len > MAX_KEYS)
+    len = MAX_KEYS;
+
+  float max_s =
+      dev_sparse_scores(Q, K, b, t_q, T_rt, C_rt, scale, scores, key_idx, len);
+  float denom = dev_softmax_denom(scores, len, max_s);
+  dev_sparse_weighted_sum(V, out_vec, scores, 1.0f / denom, key_idx, len, b,
+                          T_rt, C_rt);
 }
 
-// ------------------------------ Main ------------------------------ //
+// ==================== Host Utilities ====================
 
-int main(int argc, char** argv) {
-    // Runtime parameters with defaults
-    int T_runtime       = 1024;
-    int window_size     = 64;
-    int sink_size       = 16;
+void init_tensors(std::vector<float> &Q, std::vector<float> &K,
+                  std::vector<float> &V, int n) {
+  std::mt19937 rng(42);
+  std::uniform_real_distribution<float> dist(-0.1f, 0.1f);
+  for (int i = 0; i < n; ++i) {
+    Q[i] = dist(rng);
+    K[i] = dist(rng);
+    V[i] = dist(rng);
+  }
+}
 
-    if (argc >= 2) T_runtime   = std::atoi(argv[1]);   // ./attention_compare T
-    if (argc >= 3) window_size = std::atoi(argv[2]);   // ./attention_compare T window
-    if (argc >= 4) sink_size   = std::atoi(argv[3]);   // ./attention_compare T window sink
+void alloc_gpu(float **d_Q, float **d_K, float **d_V, float **d_O_dense,
+               float **d_O_stream, size_t bytes) {
+  CHECK_CUDA(cudaMalloc(d_Q, bytes));
+  CHECK_CUDA(cudaMalloc(d_K, bytes));
+  CHECK_CUDA(cudaMalloc(d_V, bytes));
+  CHECK_CUDA(cudaMalloc(d_O_dense, bytes));
+  CHECK_CUDA(cudaMalloc(d_O_stream, bytes));
+}
 
-    if (T_runtime > MAX_T) {
-        std::cerr << "Error: TRuntime=" << T_runtime
-                  << " > MAX_T=" << MAX_T << "\n";
-        return 1;
-    }
+float run_dense_bench(float *d_Q, float *d_K, float *d_V, float *d_O,
+                      int blocks, int threads, int T_rt, float scale, int n) {
+  cudaEvent_t s, e;
+  CHECK_CUDA(cudaEventCreate(&s));
+  CHECK_CUDA(cudaEventCreate(&e));
+  CHECK_CUDA(cudaEventRecord(s));
+  for (int i = 0; i < n; ++i) {
+    dense_attention_kernel<<<blocks, threads>>>(d_Q, d_K, d_V, d_O, B, T_rt, C,
+                                                scale);
+  }
+  CHECK_CUDA(cudaEventRecord(e));
+  CHECK_CUDA(cudaEventSynchronize(e));
+  float ms = 0.0f;
+  CHECK_CUDA(cudaEventElapsedTime(&ms, s, e));
+  CHECK_CUDA(cudaEventDestroy(s));
+  CHECK_CUDA(cudaEventDestroy(e));
+  return ms / n;
+}
 
-    if (window_size + sink_size > MAX_KEYS) {
-        std::cerr << "Error: window_size + sink_size = "
-                  << (window_size + sink_size)
-                  << " > MAX_KEYS=" << MAX_KEYS << "\n";
-        return 1;
-    }
+float run_stream_bench(float *d_Q, float *d_K, float *d_V, float *d_O,
+                       int blocks, int threads, int T_rt, int ws, int ss,
+                       float scale, int n) {
+  cudaEvent_t s, e;
+  CHECK_CUDA(cudaEventCreate(&s));
+  CHECK_CUDA(cudaEventCreate(&e));
+  CHECK_CUDA(cudaEventRecord(s));
+  for (int i = 0; i < n; ++i) {
+    streaming_attention_kernel<<<blocks, threads>>>(d_Q, d_K, d_V, d_O, B, T_rt,
+                                                    C, ws, ss, scale);
+  }
+  CHECK_CUDA(cudaEventRecord(e));
+  CHECK_CUDA(cudaEventSynchronize(e));
+  float ms = 0.0f;
+  CHECK_CUDA(cudaEventElapsedTime(&ms, s, e));
+  CHECK_CUDA(cudaEventDestroy(s));
+  CHECK_CUDA(cudaEventDestroy(e));
+  return ms / n;
+}
 
-    std::cout << "Comparing dense vs streaming sparse attention\n";
-    std::cout << "B=" << B << ", T=" << T_runtime << ", C=" << C
-              << ", WINDOW_SIZE=" << window_size
-              << ", SINK_SIZE=" << sink_size << "\n";
+void cleanup_gpu(float *d_Q, float *d_K, float *d_V, float *d_O_dense,
+                 float *d_O_stream) {
+  CHECK_CUDA(cudaFree(d_Q));
+  CHECK_CUDA(cudaFree(d_K));
+  CHECK_CUDA(cudaFree(d_V));
+  CHECK_CUDA(cudaFree(d_O_dense));
+  CHECK_CUDA(cudaFree(d_O_stream));
+}
 
-    const int num_elements = B * T_runtime * C;
-    const size_t bytes = static_cast<size_t>(num_elements) * sizeof(float);
+// Parse command line arguments
+bool parse_args(int argc, char **argv, int &T_rt, int &ws, int &ss) {
+  T_rt = 1024;
+  ws = 64;
+  ss = 16;
+  if (argc >= 2)
+    T_rt = std::atoi(argv[1]);
+  if (argc >= 3)
+    ws = std::atoi(argv[2]);
+  if (argc >= 4)
+    ss = std::atoi(argv[3]);
 
-    // Host buffers
-    std::vector<float> h_Q(num_elements);
-    std::vector<float> h_K(num_elements);
-    std::vector<float> h_V(num_elements);
-    std::vector<float> h_O_dense(num_elements);
-    std::vector<float> h_O_stream(num_elements);
+  if (T_rt > MAX_T) {
+    std::cerr << "Error: T=" << T_rt << " > MAX_T=" << MAX_T << "\n";
+    return false;
+  }
+  if (ws + ss > MAX_KEYS) {
+    std::cerr << "Error: window+sink > MAX_KEYS\n";
+    return false;
+  }
+  return true;
+}
 
-    // Random initialize Q, K, V
-    std::mt19937 rng(42);
-    std::uniform_real_distribution<float> dist(-0.1f, 0.1f);
-    for (int i = 0; i < num_elements; ++i) {
-        h_Q[i] = dist(rng);
-        h_K[i] = dist(rng);
-        h_V[i] = dist(rng);
-    }
+// Run warmup
+void warmup(float *d_Q, float *d_K, float *d_V, float *d_O_dense,
+            float *d_O_stream, int blocks, int threads, int T_rt, int ws,
+            int ss, float scale) {
+  dense_attention_kernel<<<blocks, threads>>>(d_Q, d_K, d_V, d_O_dense, B, T_rt,
+                                              C, scale);
+  streaming_attention_kernel<<<blocks, threads>>>(d_Q, d_K, d_V, d_O_stream, B,
+                                                  T_rt, C, ws, ss, scale);
+  CHECK_CUDA(cudaDeviceSynchronize());
+}
 
-    // Build the T x T attention mask on host (mainly for debugging / visualization)
-    std::vector<unsigned char> h_mask;
-    build_streaming_mask(h_mask, T_runtime, window_size, sink_size);
+// Print results
+void print_results(float ms_d, float ms_s, const std::vector<float> &h_d,
+                   const std::vector<float> &h_s) {
+  std::cout << "Dense avg: " << ms_d << " ms\n";
+  std::cout << "Stream avg: " << ms_s << " ms\n";
+  std::cout << "Speedup: " << (ms_d / ms_s) << "x\n";
+  std::cout << "Output[0]: dense=" << h_d[0] << ", stream=" << h_s[0] << "\n";
+}
 
-    // Device buffers
-    float *d_Q, *d_K, *d_V, *d_O_dense, *d_O_stream;
-    unsigned char* d_mask; // not used directly in this simple kernel, but allocated for completeness
+// Setup GPU and copy data
+void setup_gpu_data(float **d_Q, float **d_K, float **d_V, float **d_O_d,
+                    float **d_O_s, const std::vector<float> &h_Q,
+                    const std::vector<float> &h_K,
+                    const std::vector<float> &h_V, size_t bytes) {
+  alloc_gpu(d_Q, d_K, d_V, d_O_d, d_O_s, bytes);
+  CHECK_CUDA(cudaMemcpy(*d_Q, h_Q.data(), bytes, cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(*d_K, h_K.data(), bytes, cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(*d_V, h_V.data(), bytes, cudaMemcpyHostToDevice));
+}
 
-    CHECK_CUDA(cudaMalloc(&d_Q, bytes));
-    CHECK_CUDA(cudaMalloc(&d_K, bytes));
-    CHECK_CUDA(cudaMalloc(&d_V, bytes));
-    CHECK_CUDA(cudaMalloc(&d_O_dense, bytes));
-    CHECK_CUDA(cudaMalloc(&d_O_stream, bytes));
-    CHECK_CUDA(cudaMalloc(&d_mask, static_cast<size_t>(T_runtime) * T_runtime * sizeof(unsigned char)));
+// Run benchmarks and copy results
+void run_benchmarks(float *d_Q, float *d_K, float *d_V, float *d_O_d,
+                    float *d_O_s, std::vector<float> &h_O_d,
+                    std::vector<float> &h_O_s, int T_rt, int ws, int ss,
+                    size_t bytes) {
+  int threads = 128;
+  int blocks = (B * T_rt + threads - 1) / threads;
+  float scale = 1.0f / std::sqrt(static_cast<float>(C));
 
-    CHECK_CUDA(cudaMemcpy(d_Q, h_Q.data(), bytes, cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_K, h_K.data(), bytes, cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_V, h_V.data(), bytes, cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_mask, h_mask.data(),
-                          static_cast<size_t>(T_runtime) * T_runtime * sizeof(unsigned char),
-                          cudaMemcpyHostToDevice));
+  warmup(d_Q, d_K, d_V, d_O_d, d_O_s, blocks, threads, T_rt, ws, ss, scale);
 
-    // Launch configuration: one thread per (b, t)
-    int total_rows = B * T_runtime;
-    int threads = 128;
-    int blocks  = (total_rows + threads - 1) / threads;
+  float ms_d =
+      run_dense_bench(d_Q, d_K, d_V, d_O_d, blocks, threads, T_rt, scale, 10);
+  float ms_s = run_stream_bench(d_Q, d_K, d_V, d_O_s, blocks, threads, T_rt, ws,
+                                ss, scale, 10);
 
-    float scale = 1.0f / std::sqrt(static_cast<float>(C));
+  CHECK_CUDA(cudaMemcpy(h_O_d.data(), d_O_d, bytes, cudaMemcpyDeviceToHost));
+  CHECK_CUDA(cudaMemcpy(h_O_s.data(), d_O_s, bytes, cudaMemcpyDeviceToHost));
 
-    // CUDA events for timing
-    cudaEvent_t start_dense, stop_dense;
-    cudaEvent_t start_stream, stop_stream;
-    CHECK_CUDA(cudaEventCreate(&start_dense));
-    CHECK_CUDA(cudaEventCreate(&stop_dense));
-    CHECK_CUDA(cudaEventCreate(&start_stream));
-    CHECK_CUDA(cudaEventCreate(&stop_stream));
+  print_results(ms_d, ms_s, h_O_d, h_O_s);
+}
 
-    // Warm-up runs (to avoid cold-start bias)
-    dense_attention_kernel<<<blocks, threads>>>(d_Q, d_K, d_V,
-                                                d_O_dense,
-                                                B, T_runtime, C, scale);
-    streaming_attention_kernel<<<blocks, threads>>>(d_Q, d_K, d_V,
-                                                    d_O_stream,
-                                                    B, T_runtime, C,
-                                                    window_size,
-                                                    sink_size,
-                                                    scale);
-    CHECK_CUDA(cudaDeviceSynchronize());
+// ==================== Main ====================
+int main(int argc, char **argv) {
+  int T_rt, ws, ss;
+  if (!parse_args(argc, argv, T_rt, ws, ss))
+    return 1;
 
-    const int iters = 10;
+  std::cout << "Dense vs Streaming: T=" << T_rt << ", W=" << ws << ", S=" << ss
+            << "\n";
 
-    // -------- Dense timing --------
-    CHECK_CUDA(cudaEventRecord(start_dense));
-    for (int it = 0; it < iters; ++it) {
-        dense_attention_kernel<<<blocks, threads>>>(d_Q, d_K, d_V,
-                                                    d_O_dense,
-                                                    B, T_runtime, C, scale);
-    }
-    CHECK_CUDA(cudaEventRecord(stop_dense));
-    CHECK_CUDA(cudaEventSynchronize(stop_dense));
-    float ms_dense = 0.0f;
-    CHECK_CUDA(cudaEventElapsedTime(&ms_dense, start_dense, stop_dense));
-    ms_dense /= iters; // average per run
+  const int n = B * T_rt * C;
+  const size_t bytes = static_cast<size_t>(n) * sizeof(float);
 
-    // -------- Streaming timing --------
-    CHECK_CUDA(cudaEventRecord(start_stream));
-    for (int it = 0; it < iters; ++it) {
-        streaming_attention_kernel<<<blocks, threads>>>(d_Q, d_K, d_V,
-                                                        d_O_stream,
-                                                        B, T_runtime, C,
-                                                        window_size,
-                                                        sink_size,
-                                                        scale);
-    }
-    CHECK_CUDA(cudaEventRecord(stop_stream));
-    CHECK_CUDA(cudaEventSynchronize(stop_stream));
-    float ms_stream = 0.0f;
-    CHECK_CUDA(cudaEventElapsedTime(&ms_stream, start_stream, stop_stream));
-    ms_stream /= iters; // average per run
+  std::vector<float> h_Q(n), h_K(n), h_V(n);
+  std::vector<float> h_O_d(n), h_O_s(n);
+  init_tensors(h_Q, h_K, h_V, n);
 
-    std::cout << "Dense attention average time   : " << ms_dense  << " ms\n";
-    std::cout << "Streaming attention avg time   : " << ms_stream << " ms\n";
-    std::cout << "Speedup (dense / streaming)    : " << (ms_dense / ms_stream) << "x\n";
+  float *d_Q, *d_K, *d_V, *d_O_d, *d_O_s;
+  setup_gpu_data(&d_Q, &d_K, &d_V, &d_O_d, &d_O_s, h_Q, h_K, h_V, bytes);
+  run_benchmarks(d_Q, d_K, d_V, d_O_d, d_O_s, h_O_d, h_O_s, T_rt, ws, ss,
+                 bytes);
+  cleanup_gpu(d_Q, d_K, d_V, d_O_d, d_O_s);
 
-    // Optional: copy back one element to show it's not NaN
-    CHECK_CUDA(cudaMemcpy(h_O_dense.data(), d_O_dense, bytes, cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_O_stream.data(), d_O_stream, bytes, cudaMemcpyDeviceToHost));
-
-    std::cout << "Example outputs (b=0, t=0, c=0):\n";
-    std::cout << "  dense    : " << h_O_dense[0]   << "\n";
-    std::cout << "  streaming: " << h_O_stream[0]  << "\n";
-
-    // Cleanup
-    CHECK_CUDA(cudaFree(d_Q));
-    CHECK_CUDA(cudaFree(d_K));
-    CHECK_CUDA(cudaFree(d_V));
-    CHECK_CUDA(cudaFree(d_O_dense));
-    CHECK_CUDA(cudaFree(d_O_stream));
-    CHECK_CUDA(cudaFree(d_mask));
-    CHECK_CUDA(cudaEventDestroy(start_dense));
-    CHECK_CUDA(cudaEventDestroy(stop_dense));
-    CHECK_CUDA(cudaEventDestroy(start_stream));
-    CHECK_CUDA(cudaEventDestroy(stop_stream));
-
-    return 0;
+  return 0;
 }
