@@ -76,6 +76,17 @@ L        Dense        Sparse        Speedup
 
 ![Block Sparse Attention Benchmark](results/block_sparse.png)
 
+### Block Top-K Sparse Attention
+
+![GPU Runtime Table](results/gpu_runtime_table.png)
+
+**Key Observations**:
+- Top-k attention allows dynamic block selection per query
+- Maintains sub-linear scaling while preserving cross-block attention capability
+- Block-diag remains fastest due to simplest sparsity pattern
+
+![Block Top-K Sparse Attention Benchmark](results/topk_sparse.png)
+
 ## Comparison
 
 | Method | Complexity | Constant Runtime | Max Speedup | Global Context |
@@ -101,12 +112,18 @@ L        Dense        Sparse        Speedup
 - Compile-time constant arrays to avoid dynamic allocation in kernels
 
 ### Compilation
-```bash
-# Streaming attention
-nvcc -O3 -std=c++17 -arch=sm_80 --expt-relaxed-constexpr streaming_att.cu -o streaming_att
 
-# Block-diagonal sparse
-nvcc -O3 -std=c++17 -arch=sm_80 block_sparse_att.cu -o block_sparse_att
+**Using Make:**
+```bash
+make        # Build all executables
+make clean  # Remove executables
+```
+
+**Without Make:**
+```bash
+nvcc -O3 -std=c++17 -arch=sm_80 --expt-relaxed-constexpr streaming_att.cu -o streaming_att
+nvcc -O3 -std=c++17 -arch=sm_80 --expt-relaxed-constexpr block_sparse_att.cu -o block_sparse_att
+nvcc -O3 -std=c++17 -arch=sm_80 --expt-relaxed-constexpr block_topk_sparse.cu -o block_topk_sparse
 ```
 
 ## Usage
