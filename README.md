@@ -1,8 +1,8 @@
-# Sparse Attention CUDA: Block-Diagonal and Streaming Patterns
+# Sparse Attention CUDA: Block-Diagonal, Streaming, and Block Top-K Patterns
 
 ## Overview
 
-This project implements and benchmarks two sparse attention patterns in CUDA, comparing their performance against dense attention. Both methods reduce computational complexity from O(L²) to achieve significant speedups on long sequences.
+This project implements and benchmarks three sparse attention patterns in CUDA, comparing their performance against dense attention. All methods reduce computational complexity from O(L²) to achieve significant speedups on long sequences.
 
 ## Methods
 
@@ -29,6 +29,18 @@ This project implements and benchmarks two sparse attention patterns in CUDA, co
 - Memory: Constant per-token memory regardless of sequence length
 
 **Use Case**: Ideal for streaming scenarios where maintaining global context (sinks) and recent context (window) is critical.
+
+### 3. Block Top-K Sparse Attention
+
+**Concept**: Dynamically select the top-K most relevant blocks per query, enabling cross-block attention while maintaining sparsity.
+
+**Implementation** (`block_topk_sparse.cu`):
+- Score each block by max attention logit
+- Select top-K blocks per query row
+- Compute softmax only over selected blocks
+- Complexity: O(L × K × B) vs O(L²) for dense
+
+**Use Case**: When queries need to attend across block boundaries but full attention is too expensive.
 
 ## Performance Results
 
@@ -93,10 +105,12 @@ L        Dense        Sparse        Speedup
 |--------|-----------|------------------|-------------|----------------|
 | **Dense** | O(L²) | No | 1× | Full |
 | **Block-Diagonal** | O(L²/B) | Yes (up to ~2K) | 244.66× | None (block-local) |
+| **Block Top-K** | O(L × K × B) | Yes | Variable | Partial (top-K blocks) |
 | **Streaming** | O(L × (K+W)) | Yes | 38.38× | Yes (sink tokens) |
 
 **Trade-offs**:
 - **Block-Diagonal**: Highest speedup but loses global context; best for tasks where local blocks are sufficient
+- **Block Top-K**: Balances speed and cross-block attention; good for tasks needing selective long-range dependencies
 - **Streaming**: Maintains global context via sinks while achieving significant speedup; ideal for streaming/long-context scenarios
 
 ## Implementation Details
@@ -104,6 +118,7 @@ L        Dense        Sparse        Speedup
 ### Kernel Design
 - **Dense**: One thread per sequence position, computes attention over all previous tokens
 - **Block-Diagonal**: One thread per position, computes attention only within block boundaries
+- **Block Top-K**: One thread per position, scores all blocks, selects top-K, computes attention over selected blocks
 - **Streaming**: One thread per position, builds compact key list (sinks + window), then computes attention
 
 ### Memory Layout
@@ -138,6 +153,12 @@ nvcc -O3 -std=c++17 -arch=sm_80 --expt-relaxed-constexpr block_topk_sparse.cu -o
 ```bash
 ./block_sparse_att [L] [d] [B]
 # Example: ./block_sparse_att 512 64 16
+```
+
+### Block Top-K Sparse
+```bash
+./block_topk_sparse [L] [d] [B] [Kblocks]
+# Example: ./block_topk_sparse 512 64 16 2
 ```
 
 ## Technical Notes
